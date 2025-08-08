@@ -1,0 +1,235 @@
+import asyncio
+import socket
+import uuid
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import numpy as np
+import random
+import time
+
+# ---------------------------
+# 1. 노드 코어 시스템
+# ---------------------------
+class DecentralizedNode:
+    def __init__(self):
+        self.node_id = str(uuid.uuid4())
+        self.private_key = ec.generate_private_key(ec.SECP384R1())
+        self.public_key = self.private_key.public_key()
+        self.location = (random.uniform(-90, 90), random.uniform(-180, 180)  # 위도, 경도
+        self.routing_table = {}
+        self.message_cache = {}
+        self.connections = set()
+        
+    def get_identity(self):
+        return {
+            "node_id": self.node_id,
+            "public_key": self.public_key.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            ).decode(),
+            "location": self.location
+        }
+
+# ---------------------------
+# 2. 암호화 시스템
+# ---------------------------
+class CryptoEngine:
+    @staticmethod
+    def derive_key(peer_public_key, private_key):
+        shared_key = private_key.exchange(ec.ECDH(), peer_public_key)
+        return HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b'mesh_encryption'
+        ).derive(shared_key)
+
+    @staticmethod
+    def encrypt_message(key, plaintext):
+        iv = os.urandom(16)
+        cipher = Cipher(algorithms.AES(key), modes.GCM(iv))
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+        return iv + encryptor.tag + ciphertext
+
+    @staticmethod
+    def decrypt_message(key, ciphertext):
+        iv, tag, ct = ciphertext[:16], ciphertext[16:32], ciphertext[32:]
+        cipher = Cipher(algorithms.AES(key), modes.GCM(iv, tag))
+        decryptor = cipher.decryptor()
+        return decryptor.update(ct) + decryptor.finalize()
+
+# ---------------------------
+# 3. 지리적 라우팅 시스템
+# ---------------------------
+class GeoRouter:
+    @staticmethod
+    def calculate_distance(loc1, loc2):
+        # 간소화된 거리 계산 (Haversine 대신 유클리드 거리 사용)
+        return np.sqrt((loc1[0]-loc2[0])**2 + (loc1[1]-loc2[1])**2)
+
+    def find_relay_path(self, source, target, nodes):
+        # A* 알고리즘 변형
+        open_set = {source.node_id: source}
+        came_from = {}
+        g_score = {source.node_id: 0}
+        
+        while open_set:
+            current = min(open_set.values(), key=lambda x: g_score[x.node_id])
+            if current.node_id == target.node_id:
+                path = [current]
+                while current.node_id in came_from:
+                    current = came_from[current.node_id]
+                    path.append(current)
+                return path[::-1]
+                
+            open_set.pop(current.node_id)
+            
+            for neighbor in self.get_neighbors(current, nodes):
+                tentative_g_score = g_score[current.node_id] + self.calculate_distance(
+                    current.location, neighbor.location)
+                
+                if neighbor.node_id not in g_score or tentative_g_score < g_score[neighbor.node_id]:
+                    came_from[neighbor.node_id] = current
+                    g_score[neighbor.node_id] = tentative_g_score
+                    if neighbor.node_id not in open_set:
+                        open_set[neighbor.node_id] = neighbor
+        return []
+
+    def get_neighbors(self, node, all_nodes, max_range=0.1):
+        return [n for n in all_nodes if 
+                self.calculate_distance(node.location, n.location) < max_range 
+                and n.node_id != node.node_id]
+
+# ---------------------------
+# 4. 분산 데이터 전송 시스템
+# ---------------------------
+class FluxTransport:
+    def __init__(self):
+        self.shard_lifetime = 3600  # 1시간 유지
+
+    def shard_data(self, data, num_shards=3):
+        shards = {}
+        for i in range(num_shards):
+            shard_id = str(uuid.uuid4())
+            shards[shard_id] = {
+                "data": data[i::num_shards],
+                "index": i,
+                "total": num_shards
+            }
+        return shards
+
+    def reassemble_data(self, shards):
+        sorted_shards = sorted(shards.values(), key=lambda x: x["index"])
+        return b''.join([s["data"] for s in sorted_shards])
+
+# ---------------------------
+# 5. 메인 네트워크 시스템
+# ---------------------------
+class MeshNetwork:
+    def __init__(self):
+        self.nodes = []
+        self.router = GeoRouter()
+        self.transport = FluxTransport()
+        
+    async def start_network(self, num_nodes=10):
+        # 네트워크 초기화
+        self.nodes = [DecentralizedNode() for _ in range(num_nodes)]
+        
+        # 시뮬레이션용 연결 설정
+        for node in self.nodes:
+            await self.discover_neighbors(node)
+            
+    async def discover_neighbors(self, node):
+        neighbors = self.router.get_neighbors(node, self.nodes)
+        node.routing_table = {n.node_id: n for n in neighbors}
+        
+    async def send_message(self, sender, receiver, message):
+        # 1. 경로 탐색
+        path = self.router.find_relay_path(sender, receiver, self.nodes)
+        if not path:
+            raise Exception("No path found")
+            
+        # 2. 데이터 분할
+        shards = self.transport.shard_data(message.encode())
+        
+        # 3. 각 샤드별로 다른 경로로 전송
+        for shard_id, shard in shards.items():
+            alternate_path = self.router.find_relay_path(
+                sender, 
+                random.choice(self.nodes),  # 의도적으로 다른 노드로
+                self.nodes
+            )
+            await self._send_shard(alternate_path, shard_id, shard)
+            
+    async def _send_shard(self, path, shard_id, shard):
+        current_node = path[0]
+        for next_node in path[1:]:
+            try:
+                # 암호화 설정
+                key = CryptoEngine.derive_key(
+                    next_node.public_key,
+                    current_node.private_key
+                )
+                
+                # 메시지 패키징
+                encrypted = CryptoEngine.encrypt_message(
+                    key,
+                    f"{shard_id}|{shard['index']}|{shard['total']}|".encode() + shard["data"]
+                )
+                
+                # 시뮬레이션 전송 (실제로는 소켓 사용)
+                next_node.message_cache[shard_id] = {
+                    "data": encrypted,
+                    "sender": current_node.node_id,
+                    "timestamp": time.time()
+                }
+                
+                current_node = next_node
+            except Exception as e:
+                print(f"전송 실패: {e}")
+                break
+
+# ---------------------------
+# 실행 예제
+# ---------------------------
+async def main():
+    network = MeshNetwork()
+    await network.start_network(num_nodes=20)
+    
+    # 노드 A에서 노드 B로 메시지 전송
+    sender = network.nodes[0]
+    receiver = network.nodes[-1]
+    
+    print(f"발신자 위치: {sender.location}")
+    print(f"수신자 위치: {receiver.location}")
+    
+    await network.send_message(
+        sender,
+        receiver,
+        "이 메시지는 ISP 없이 전송됩니다!"
+    )
+    
+    # 수신자가 메시지 재조립 (시뮬레이션)
+    received_shards = {}
+    for shard_id, shard_data in receiver.message_cache.items():
+        key = CryptoEngine.derive_key(
+            sender.public_key,
+            receiver.private_key
+        )
+        decrypted = CryptoEngine.decrypt_message(key, shard_data["data"])
+        parts = decrypted.split(b"|")
+        shard_id, index, total = parts[0].decode(), int(parts[1]), int(parts[2])
+        received_shards[shard_id] = {
+            "index": index,
+            "total": total,
+            "data": parts[3]
+        }
+    
+    if len(received_shards) >= 2:  # 샤드 2개 이상 수신 시
+        full_message = network.transport.reassemble_data(received_shards)
+        print(f"수신된 메시지: {full_message.decode()}")
+
+asyncio.run(main())
